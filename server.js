@@ -50,6 +50,60 @@ const MODEL_IDS = [
 // Se puede cambiar con la variable de entorno DEFAULT_MODEL en Render.
 const DEFAULT_MODEL = process.env.DEFAULT_MODEL || 'moonshotai/kimi-k3.1-pro';
 
+const NIM_URL = 'https://integrate.api.nvidia.com/v1/chat/completions';
+
+// Lee el cuerpo de un error de NVIDIA (puede venir como stream, texto u objeto)
+async function readErrorBody(data) {
+  if (data && typeof data.pipe === 'function') {
+    return new Promise((resolve) => {
+      let body = '';
+      data.on('data', (chunk) => { body += chunk.toString(); });
+      data.on('end', () => resolve(body));
+      data.on('error', () => resolve(body));
+    });
+  }
+  if (typeof data === 'string') return data;
+  try { return JSON.stringify(data); } catch (e) { return ''; }
+}
+
+// Envía la petición a NVIDIA. Si NVIDIA responde 400 diciendo que un parámetro
+// "is fixed at X" (fijo en X), lo corrige solo y reintenta (hasta 6 veces).
+async function postToNim(body, apiKey, stream) {
+  const fixed = new Set();
+  for (let attempt = 0; attempt < 6; attempt++) {
+    try {
+      return await axios.post(NIM_URL, body, {
+        headers: {
+          'Authorization': `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+          ...(stream ? { 'Accept': 'text/event-stream' } : {})
+        },
+        responseType: stream ? 'stream' : 'json'
+      });
+    } catch (error) {
+      if (!error.response || error.response.status !== 400) throw error;
+
+      const raw = await readErrorBody(error.response.data);
+      const m = raw.match(/`([a-z_]+)` is fixed at ([-\d.]+)/i);
+
+      if (m && !fixed.has(m[1])) {
+        fixed.add(m[1]);
+        console.log(`  auto-fix: ${m[1]} -> ${m[2]}`);
+        body[m[1]] = Number(m[2]);
+        continue;
+      }
+
+      let parsed;
+      try { parsed = JSON.parse(raw); } catch (e) {
+        parsed = { error: { message: raw || 'Upstream error', type: 'upstream_error' } };
+      }
+      error.upstream = { status: 400, data: parsed };
+      throw error;
+    }
+  }
+  throw new Error('Demasiados reintentos al corregir parámetros');
+}
+
 // Health check endpoint
 app.get('/', (req, res) => {
   res.json({
@@ -117,7 +171,18 @@ app.post('/v1/chat/completions', async (req, res) => {
       nimRequest.presence_penalty = presence_penalty;
     }
 
-    const nimUrl = 'https://integrate.api.nvidia.com/v1/chat/completions';
+    // Kimi K3.1 Pro: parámetros fijos y razonamiento siempre activo.
+    // - top_p = 0.95 y penalizaciones en 0 (NVIDIA devuelve 400 con otros valores)
+    // - mínimo de tokens para que no se gasten todos pensando (respuesta vacía)
+    if (nimModel.toLowerCase().includes('kimi-k3')) {
+      nimRequest.top_p = 0.95;
+      delete nimRequest.frequency_penalty;
+      delete nimRequest.presence_penalty;
+      const minTokens = parseInt(process.env.KIMI_MIN_TOKENS || '3000', 10);
+      if (!nimRequest.max_tokens || nimRequest.max_tokens < minTokens) {
+        nimRequest.max_tokens = minTokens;
+      }
+    }
 
     // Resumen para depurar (sin mostrar el contenido de los mensajes ni la key)
     console.log(
@@ -135,14 +200,7 @@ app.post('/v1/chat/completions', async (req, res) => {
 
     if (stream) {
       // Streaming response
-      const response = await axios.post(nimUrl, nimRequest, {
-        headers: {
-          'Authorization': `Bearer ${apiKey}`,
-          'Content-Type': 'application/json',
-          'Accept': 'text/event-stream'
-        },
-        responseType: 'stream'
-      });
+      const response = await postToNim(nimRequest, apiKey, true);
 
       res.setHeader('Content-Type', 'text/event-stream');
       res.setHeader('Cache-Control', 'no-cache');
@@ -151,12 +209,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       response.data.pipe(res);
     } else {
       // Non-streaming response
-      const response = await axios.post(nimUrl, nimRequest, {
-        headers: {
-          'Authorization': `Bearer ${apiKey}`,
-          'Content-Type': 'application/json'
-        }
-      });
+      const response = await postToNim(nimRequest, apiKey, false);
 
       // Return NVIDIA NIM response as-is (already in OpenAI format)
       res.json(response.data);
@@ -165,26 +218,17 @@ app.post('/v1/chat/completions', async (req, res) => {
     console.error('Error proxying request:', error.message);
 
     if (error.response) {
-      // Forward NVIDIA NIM error response
-      // (si la respuesta es un stream, se lee antes de reenviarla)
       const status = error.response.status;
-      const data = error.response.data;
-      if (data && typeof data.pipe !== 'function') {
-        console.error('NVIDIA respondió con error:', status, JSON.stringify(data).slice(0, 1500));
+      let data = error.upstream ? error.upstream.data : null;
+
+      if (!data) {
+        const raw = await readErrorBody(error.response.data);
+        try { data = JSON.parse(raw); } catch (e) {
+          data = { error: { message: raw || 'Upstream error', type: 'upstream_error' } };
+        }
       }
-      if (data && typeof data.pipe === 'function') {
-        let body = '';
-        data.on('data', (chunk) => { body += chunk.toString(); });
-        data.on('end', () => {
-          console.error('NVIDIA respondió con error:', status, body.slice(0, 1500));
-          try {
-            res.status(status).json(JSON.parse(body));
-          } catch (e) {
-            res.status(status).json({ error: { message: body || 'Upstream error', type: 'upstream_error' } });
-          }
-        });
-        return;
-      }
+
+      console.error('NVIDIA respondió con error:', status, JSON.stringify(data).slice(0, 1500));
       return res.status(status).json(data);
     }
 
