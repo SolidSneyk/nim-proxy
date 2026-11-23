@@ -2,24 +2,42 @@ const express = require('express');
 const axios = require('axios');
 const app = express();
 
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
 
 // CORS middleware
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-  
+
   if (req.method === 'OPTIONS') {
     return res.sendStatus(200);
   }
   next();
 });
 
+// Lista de modelos que aparecerán en /v1/models (y en el desplegable de Chub).
+// IMPORTANTE: los IDs deben coincidir EXACTO con build.nvidia.com.
+// Si algún ID da error 404, corrígelo copiándolo del catálogo de NVIDIA.
+const MODEL_IDS = [
+  'moonshotai/kimi-k3.1-pro',
+  'deepseek-ai/deepseek-v4.1-flash',
+  'deepseek-ai/deepseek-v4-pro',
+  'meta/llama-3.1-405b-instruct',
+  'meta/llama-3.1-70b-instruct',
+  'meta/llama-3.1-8b-instruct',
+  'mistralai/mixtral-8x7b-instruct-v0.1'
+];
+
+// Modelo de respaldo: se usa si el cliente (por ejemplo Chub) manda un nombre
+// que no es un ID de NVIDIA (sin "/"), como "gpt-4o".
+// Se puede cambiar con la variable de entorno DEFAULT_MODEL en Render.
+const DEFAULT_MODEL = process.env.DEFAULT_MODEL || 'moonshotai/kimi-k3.1-pro';
+
 // Health check endpoint
 app.get('/', (req, res) => {
-  res.json({ 
-    status: 'ok', 
+  res.json({
+    status: 'ok',
     message: 'NVIDIA NIM to OpenAI API Proxy',
     endpoints: {
       chat: '/v1/chat/completions',
@@ -32,32 +50,12 @@ app.get('/', (req, res) => {
 app.get('/v1/models', (req, res) => {
   res.json({
     object: 'list',
-    data: [
-      {
-        id: 'meta/llama-3.1-405b-instruct',
-        object: 'model',
-        created: 1686935002,
-        owned_by: 'nvidia'
-      },
-      {
-        id: 'meta/llama-3.1-70b-instruct',
-        object: 'model',
-        created: 1686935002,
-        owned_by: 'nvidia'
-      },
-      {
-        id: 'meta/llama-3.1-8b-instruct',
-        object: 'model',
-        created: 1686935002,
-        owned_by: 'nvidia'
-      },
-      {
-        id: 'mistralai/mixtral-8x7b-instruct-v0.1',
-        object: 'model',
-        created: 1686935002,
-        owned_by: 'nvidia'
-      }
-    ]
+    data: MODEL_IDS.map((id) => ({
+      id,
+      object: 'model',
+      created: 1686935002,
+      owned_by: 'nvidia'
+    }))
   });
 });
 
@@ -66,7 +64,7 @@ app.post('/v1/chat/completions', async (req, res) => {
   try {
     const authHeader = req.headers.authorization;
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return res.status(401).json({ 
+      return res.status(401).json({
         error: { message: 'Missing or invalid Authorization header', type: 'invalid_request_error' }
       });
     }
@@ -76,13 +74,14 @@ app.post('/v1/chat/completions', async (req, res) => {
 
     // Validate required fields
     if (!messages || !Array.isArray(messages)) {
-      return res.status(400).json({ 
+      return res.status(400).json({
         error: { message: 'Messages array is required', type: 'invalid_request_error' }
       });
     }
 
-    // Default model if not specified
-    const nimModel = model || 'meta/llama-3.1-8b-instruct';
+    // Si el modelo trae "/" se respeta (ID real de NVIDIA).
+    // Si no, se usa el modelo de respaldo.
+    const nimModel = (model && model.includes('/')) ? model : DEFAULT_MODEL;
 
     // Build NVIDIA NIM request
     const nimRequest = {
@@ -134,17 +133,32 @@ app.post('/v1/chat/completions', async (req, res) => {
     }
   } catch (error) {
     console.error('Error proxying request:', error.message);
-    
+
     if (error.response) {
       // Forward NVIDIA NIM error response
-      return res.status(error.response.status).json(error.response.data);
+      // (si la respuesta es un stream, se lee antes de reenviarla)
+      const status = error.response.status;
+      const data = error.response.data;
+      if (data && typeof data.pipe === 'function') {
+        let body = '';
+        data.on('data', (chunk) => { body += chunk.toString(); });
+        data.on('end', () => {
+          try {
+            res.status(status).json(JSON.parse(body));
+          } catch (e) {
+            res.status(status).json({ error: { message: body || 'Upstream error', type: 'upstream_error' } });
+          }
+        });
+        return;
+      }
+      return res.status(status).json(data);
     }
-    
+
     // Generic error response
-    res.status(500).json({ 
-      error: { 
-        message: error.message || 'Internal server error', 
-        type: 'server_error' 
+    res.status(500).json({
+      error: {
+        message: error.message || 'Internal server error',
+        type: 'server_error'
       }
     });
   }
@@ -154,25 +168,25 @@ app.post('/v1/chat/completions', async (req, res) => {
 app.post('/v1/completions', async (req, res) => {
   try {
     const { prompt, ...otherParams } = req.body;
-    
+
     // Convert prompt to messages format
     const messages = [{ role: 'user', content: prompt }];
-    
+
     // Forward to chat completions endpoint
     req.body = {
       messages,
       ...otherParams
     };
-    
+
     return app._router.handle(
       { ...req, url: '/v1/chat/completions', method: 'POST' },
       res
     );
   } catch (error) {
-    res.status(500).json({ 
-      error: { 
-        message: error.message || 'Internal server error', 
-        type: 'server_error' 
+    res.status(500).json({
+      error: {
+        message: error.message || 'Internal server error',
+        type: 'server_error'
       }
     });
   }
@@ -181,10 +195,10 @@ app.post('/v1/completions', async (req, res) => {
 // Error handling middleware
 app.use((err, req, res, next) => {
   console.error('Unhandled error:', err);
-  res.status(500).json({ 
-    error: { 
-      message: 'Internal server error', 
-      type: 'server_error' 
+  res.status(500).json({
+    error: {
+      message: 'Internal server error',
+      type: 'server_error'
     }
   });
 });
