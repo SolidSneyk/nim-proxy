@@ -4,6 +4,17 @@ const app = express();
 
 app.use(express.json({ limit: '10mb' }));
 
+// Registro simple de peticiones (aparece en la pestaña Logs gratuita de Render).
+// No muestra la API key ni el contenido de los mensajes.
+app.use((req, res, next) => {
+  const model = req.body && req.body.model ? ` model=${req.body.model}` : '';
+  console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}${model}`);
+  res.on('finish', () => {
+    console.log(`  -> ${req.method} ${req.url} respondió ${res.statusCode}`);
+  });
+  next();
+});
+
 // CORS middleware
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
