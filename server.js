@@ -119,6 +119,20 @@ app.post('/v1/chat/completions', async (req, res) => {
 
     const nimUrl = 'https://integrate.api.nvidia.com/v1/chat/completions';
 
+    // Resumen para depurar (sin mostrar el contenido de los mensajes ni la key)
+    console.log(
+      '  params:',
+      JSON.stringify({
+        model: nimModel,
+        temperature: nimRequest.temperature,
+        top_p: nimRequest.top_p,
+        max_tokens: nimRequest.max_tokens,
+        stream: nimRequest.stream,
+        n_messages: messages.length,
+        roles: messages.map((m) => m.role).join(',')
+      })
+    );
+
     if (stream) {
       // Streaming response
       const response = await axios.post(nimUrl, nimRequest, {
@@ -155,10 +169,14 @@ app.post('/v1/chat/completions', async (req, res) => {
       // (si la respuesta es un stream, se lee antes de reenviarla)
       const status = error.response.status;
       const data = error.response.data;
+      if (data && typeof data.pipe !== 'function') {
+        console.error('NVIDIA respondió con error:', status, JSON.stringify(data).slice(0, 1500));
+      }
       if (data && typeof data.pipe === 'function') {
         let body = '';
         data.on('data', (chunk) => { body += chunk.toString(); });
         data.on('end', () => {
+          console.error('NVIDIA respondió con error:', status, body.slice(0, 1500));
           try {
             res.status(status).json(JSON.parse(body));
           } catch (e) {
